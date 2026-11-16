@@ -1,5 +1,6 @@
 """Connection and utility tools for MuseScore MCP."""
 
+import asyncio
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
 from fastmcp import FastMCP
@@ -32,6 +33,32 @@ def setup_connection_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
     )
     async def ping_musescore():
         return await client.send_command("ping")
+
+    @mcp.tool(
+        description=(
+            "Reload the MuseScore plugin from its QML file, e.g. after the plugin was changed, without "
+            "restarting MuseScore. The open score and its undo history are kept. Needs a MuseScore that restarts "
+            "a plugin which is run again (built from this project's MuseScore branch)."
+        ),
+        tags={"connection"},
+    )
+    async def reload_plugin():
+        before = await client.request("pluginInfo")
+        await client.request("reloadPlugin")
+        await client.close()
+        # MuseScore replaces the plugin after the reply, and closes the connection
+        for _ in range(20):
+            await asyncio.sleep(0.25)
+            res = await client.send_command("pluginInfo")
+            result = res.get("result")
+            if isinstance(result, dict) and result.get(
+                "startedAt", 0
+            ) > before.get("startedAt", 0):
+                return {"success": True, "message": "Plugin reloaded"}
+        return {
+            "success": False,
+            "error": "The plugin did not restart: is this MuseScore built from this project's branch?",
+        }
 
     @mcp.tool(
         description=(

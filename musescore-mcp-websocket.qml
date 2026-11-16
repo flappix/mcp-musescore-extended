@@ -9,6 +9,13 @@ MuseScore {
     version: "2.0"
     
     property var clientConnections: []
+    // The voice the cursor tools write in, 0-3 (voices 1-4): set by goToMeasure and setVoice
+    property int currentVoice: 0
+    // When this instance started: reload_plugin waits for a newer one
+    property double startedAt: 0
+    // MuseScore restarts a plugin that is run again, with its QML file read anew (MuseScore built from this
+    // project's branch); the action is "action://extensions/v1/" + the lowercased path in the plugins folder
+    readonly property string selfAction: "action://extensions/v1/musescore-mcp-websocket.qml?action=main"
     property var selectionState: ({
         startStaff: 0,
         endStaff: 1,
@@ -46,6 +53,8 @@ MuseScore {
             case "getScore":                return getScore(command.params);
             case "syncStateToSelection":    return syncStateToSelection();
             case "ping":                    return "pong";
+            case "pluginInfo":              return { success: true, startedAt: startedAt };
+            case "reloadPlugin":            return reloadPlugin();
             case "undo":                    return undo();
             case "goToBeginningOfScore":    return goToBeginningOfScore();
             case "processSequence":         return processSequence(command.params);
@@ -53,6 +62,7 @@ MuseScore {
             // Navigation
             case "getCursorInfo":           return getCursorInfo(command.params);
             case "goToMeasure":             return goToMeasure(command.params);
+            case "setVoice":                return setVoice(command.params);
             case "goToFinalMeasure":        return goToFinalMeasure(command.params);
             case "nextElement":             return nextElement(command.params);
             case "prevElement":             return prevElement(command.params);
@@ -83,6 +93,20 @@ MuseScore {
             case "setStaffMute":            return setStaffMute(command.params);
             case "setInstrumentSound":      return setInstrumentSound(command.params);
             case "setTimeSignature":        return setTimeSignature(command.params);
+            case "setKeySignature":         return setKeySignature(command.params);
+            case "addChordSymbols":         return addChordSymbols(command.params);
+            case "transposeToKey":          return transposeToKey(command.params);
+            case "addDynamics":             return addDynamics(command.params);
+            case "addLines":                return addLines(command.params);
+            case "addSlides":               return addSlides(command.params);
+            case "setLoop":                 return setLoop(command.params);
+            case "play":                    return playback(command.params, "play-start", "Playing");
+            case "stop":                    return playback(command.params, "stop", "Stopped");
+            case "setPlaybackSpeed":        return setPlaybackSpeed(command.params);
+            case "setStaffMix":             return setStaffMix(command.params);
+            case "setVoicePlayback":        return setVoicePlayback(command.params);
+            case "setMetronome":            return setMetronome(command.params);
+            case "newScore":                return newScore(command.params);
             case "setTempo":                return setTempo(command.params);
 
             // Repeats & Formatting
@@ -231,6 +255,12 @@ MuseScore {
         };
     }
 
+    function reloadPlugin() {
+        // After the reply is sent: MuseScore then replaces this instance and closes the connections
+        Qt.callLater(function() { cmd(selfAction); });
+        return { success: true, startedAt: startedAt, message: "Restarting the plugin from its QML file" };
+    }
+
     function executeWithUndo(operation) {
         if (!curScore) return { error: "No score open" };
         
@@ -277,20 +307,28 @@ MuseScore {
     function createCursor(params) {
         if (!curScore) throw new Error("No score open");
         
+        // The cursor tools (no parameters: the current position) write in the current voice; others in
+        // the voice they ask for, or the first
+        var voice = 0;
         if (!params || Object.keys(params).length === 0) {
             params = selectionState;
+            voice = currentVoice;
         }
+        if (params.voice !== undefined) voice = params.voice;
         
         var cursor = curScore.newCursor();
         cursor.inputStateMode = Cursor.INPUT_STATE_SYNC_WITH_SCORE;
         
         // Set track
         if (params.startStaff !== undefined) cursor.staffIdx = params.startStaff;
-        if (params.voice !== undefined) cursor.voice = params.voice;
+        cursor.voice = voice;
         
         // Position cursor
         if (params.rewindMode !== undefined) {
             cursor.rewind(params.rewindMode);
+        } else if (params.startTick !== undefined && voice > 0 && typeof cursor.moveToTick === "function"
+                   && cursor.moveToTick(params.startTick)) {
+            // Exactly there, also where this voice has nothing yet (rewindToTick moves on to its next element)
         } else if (params.startTick !== undefined) {
             try {
                 cursor.rewindToTick(params.startTick);
@@ -436,7 +474,7 @@ MuseScore {
 
         var validCommands = [
             "getScore", "addNote", "addTie", "addTiedNote", "addRest", "addTuplet", "appendMeasure", "deleteSelection",
-            "getCursorInfo", "goToMeasure", "nextElement", "prevElement", "nextStaff", "prevStaff",
+            "getCursorInfo", "goToMeasure", "setVoice", "nextElement", "prevElement", "nextStaff", "prevStaff",
             "selectCurrentMeasure", "processSequence", "insertMeasure", "goToFinalMeasure",
             "goToBeginningOfScore", "setTimeSignature", "addLyrics", "addInstrument",
             "setStaffMute", "setInstrumentSound", "setTempo",
@@ -453,7 +491,16 @@ MuseScore {
                 if (!validCommands.includes(command.action)) {
                     throw new Error("Invalid command: " + command.action);
                 }
-                processCommand(command);
+                // Stop at the first step that fails: the steps after it would act at the wrong place
+                // (e.g. notes meant for another staff written over this one)
+                var result = processCommand(command);
+                if (result && (result.error || result.success === false)) {
+                    return {
+                        error: "Step " + (i + 1) + " (" + command.action + ") failed: " + String(result.error || result.message || "no details").replace(/\.+$/, "") +
+                               ". The " + i + " step(s) before it were applied; the rest were not run.",
+                        completedSteps: i
+                    };
+                }
             }
             return { success: true, message: "Sequence processed", currentSelection: selectionState };
         } catch (e) {
@@ -472,8 +519,12 @@ MuseScore {
             var selection = curScore.selection;
             var startSegment = selection.startSegment;
             var endSegment = selection.endSegment;
+            // A range that runs to the end of the score has no end segment: e.g. the last rest, which addNote
+            // selects after writing the note before it. Without this the cursor stayed on the note just written,
+            // and the next note overwrote it.
+            var endTick = endSegment ? endSegment.tick : curScore.lastSegment.tick;
 
-            if (startSegment && endSegment) {
+            if (startSegment && selection.isRange) {
                 var cursor = createCursor({
                     startTick: startSegment.tick,
                     startStaff: selection.startStaff    
@@ -485,7 +536,7 @@ MuseScore {
                 }
 
                 var currentSegment = startSegment;
-                while (currentSegment && currentSegment.tick < endSegment.tick) {
+                while (currentSegment && currentSegment.tick < endTick) {
                     for (var s = selection.startStaff; s < selection.endStaff; s++) {
                         for (var v = 0; v < 4; v++) {
                             var track = s * 4 + v;
@@ -508,7 +559,7 @@ MuseScore {
                     endStaff: selection.endStaff,
                     startTick: startSegment.tick,
                     elements: elementsMap,
-                    totalDuration: endSegment.tick - startSegment.tick
+                    totalDuration: endTick - startSegment.tick
                 };
             } else {
                 var c = createCursor();
@@ -571,9 +622,31 @@ MuseScore {
             return { error: "Invalid measure number" };
         }
 
+        // Voices are numbered 1-4 as in MuseScore
+        var voice = params.voice !== undefined && params.voice !== null ? params.voice : 1;
+        if (voice < 1 || voice > 4) return { error: "voice must be 1 to 4" };
+        if (voice > 1 && typeof curScore.newCursor().moveToTick !== "function") {
+            return { error: "This MuseScore cannot write voices 2-4 from a plugin (needs MuseScore built from this project's branch)" };
+        }
+
         var range = measureRange({ startMeasure: params.measure });
         if (!range.valid) return range;
-        return selectWholeMeasure(range);
+        currentVoice = voice - 1;
+        var result = selectWholeMeasure(range);
+        result.voice = voice;
+        return result;
+    }
+
+    // Write in another voice (1-4) of the staff at the cursor, from the cursor's position on
+    function setVoice(params) {
+        var validation = validateParams(params, ["voice"]);
+        if (!validation.valid) return validation;
+        if (params.voice < 1 || params.voice > 4) return { error: "voice must be 1 to 4" };
+        if (params.voice > 1 && typeof curScore.newCursor().moveToTick !== "function") {
+            return { error: "This MuseScore cannot write voices 2-4 from a plugin (needs MuseScore built from this project's branch)" };
+        }
+        currentVoice = params.voice - 1;
+        return { success: true, message: "Writing in voice " + params.voice, voice: params.voice, currentSelection: selectionState };
     }
 
     function nextElement(params) {
@@ -663,11 +736,12 @@ MuseScore {
         return executeWithUndo(function() {
             syncStateToSelection();
 
-            if (selectionState.endStaff >= curScore.nstaves) {
+            // The cursor is on the first staff of the selection, also when it spans several staves
+            // (go_to_measure selects the measure on every staff): the next staff is the one below it
+            var newStaff = selectionState.startStaff + 1;
+            if (newStaff >= curScore.nstaves) {
                 return { success: false, message: "Already at last staff" };
             }
-
-            var newStaff = selectionState.endStaff;
             var cursor = createCursor({ 
                 startTick: selectionState.startTick, 
                 startStaff: newStaff 
@@ -849,26 +923,73 @@ MuseScore {
     // NOTE & MUSIC OPERATIONS
     // ========================================
 
+    // MuseScore ignores a pitch outside MIDI's range, or a length that is no note value, without an error:
+    // check them first, so that a command reports what it could not write
+
+    function pitchError(pitch) {
+        if (typeof pitch !== "number" || pitch !== Math.floor(pitch) || pitch < 0 || pitch > 127) {
+            return "Invalid pitch " + JSON.stringify(pitch) + ": a MIDI pitch is a whole number from 0 to 127 (60 is middle C)";
+        }
+        return null;
+    }
+
+    // A note value is a power of two (a whole note, a half...) with up to four dots: 1/4, 3/8, 7/16, 15/32...
+    // Other lengths, e.g. 1/3, need a tuplet (addTuplet).
+    function noteValueError(duration) {
+        var usage = "Duration must be { numerator: int, denominator: int }, a note value such as 1/4 or 3/8 (dotted)";
+        if (!duration || !duration.numerator || !duration.denominator) return usage;
+        var n = duration.numerator, d = duration.denominator;
+        if (n !== Math.floor(n) || d !== Math.floor(d) || n <= 0 || d <= 0) return usage;
+        var value = n / d;
+        var base = Math.pow(2, Math.floor(Math.log(value) / Math.LN2 + 1e-9));
+        var dotted = [1, 1.5, 1.75, 1.875, 1.9375];
+        if (value > 4 || value < 1 / 1024 || dotted.indexOf(value / base) < 0) {
+            return "Duration " + n + "/" + d + " is no note value (a whole, half, quarter... note, dotted up to four times); " +
+                   "use addTuplet for triplets and other tuplets";
+        }
+        return null;
+    }
+
     function addNote(params) {
         var validation = validateParams(params, ["pitch", "duration", "advanceCursorAfterAction"]);
         if (!validation.valid) return validation;
+        var invalidPitch = pitchError(params.pitch);
+        if (invalidPitch) return { error: invalidPitch };
 
-        if (!params.duration.numerator || !params.duration.denominator) {
-            return { error: "Duration must be specified as { numerator: int, denominator: int }" };
-        }
+        var durationError = noteValueError(params.duration);
+        if (durationError) return { error: durationError };
 
         return executeWithUndo(function() {
             syncStateToSelection();
             
             var cursor = createCursor();
+            // MuseScore ignores a note at no position (past the last measure) without an error
+            if (!cursor.segment) {
+                throw new Error("The cursor is at the end of the score: append measures to write more");
+            }
             cursor.setDuration(params.duration.numerator, params.duration.denominator);
             
             // Melody is the default. Pass addToChord: true to stack a pitch on the current chord.
             cursor.addNote(params.pitch, params.addToChord === true);
             cursor.rewindToTick(selectionState.startTick);
+            var staffIdxWritten = cursor.staffIdx;
 
-            if (params.advanceCursorAfterAction) {
-                cursor.next();
+            if (params.advanceCursorAfterAction && !advanceCursor(cursor)) {
+                // Past the last note of the score: stay on this staff, at the end, so that the next note is
+                // refused instead of being written at a stale position (which may be on another staff)
+                curScore.selection.clear();
+                selectionState = {
+                    startStaff: staffIdxWritten,
+                    endStaff: staffIdxWritten + 1,
+                    startTick: curScore.lastSegment.tick,
+                    elements: {},
+                    totalDuration: 0
+                };
+                return {
+                    success: true,
+                    message: "Note added with pitch " + params.pitch + "; the cursor is at the end of the score (append measures to write more)",
+                    currentSelection: selectionState
+                };
             }
 
             var element = processElement(cursor.element);
@@ -881,18 +1002,18 @@ MuseScore {
                 curScore.selection.selectRange(startTick, startTick + durationTicks, staffIdx, staffIdx + 1);
             }
 
-            var syncRes = syncStateToSelection();
-            if (syncRes && syncRes.error) {
-                var staffMap = {};
-                staffMap["staff" + staffIdx] = element ? [element] : [];
-                selectionState = {
-                    startStaff: staffIdx,
-                    endStaff: staffIdx + 1,
-                    startTick: startTick,
-                    elements: staffMap,
-                    totalDuration: durationTicks
-                };
-            }
+            // The position is the cursor's: the range selected above is applied only when the command ends,
+            // so reading it back here gave the previous selection (the note just written) instead
+            if (element) element.startTick = startTick;
+            var staffMap = {};
+            staffMap["staff" + staffIdx] = element ? [element] : [];
+            selectionState = {
+                startStaff: staffIdx,
+                endStaff: staffIdx + 1,
+                startTick: startTick,
+                elements: staffMap,
+                totalDuration: durationTicks
+            };
 
             return { 
                 success: true, 
@@ -900,6 +1021,16 @@ MuseScore {
                 currentSelection: selectionState
             };
         });
+    }
+
+    // Moves the cursor past the element it is on; false at the end of the score. In voices 2-4 by the element's
+    // length: the voice's next element may be measures away (or there may be none), while the next note of the
+    // voice belongs right after this one
+    function advanceCursor(cursor) {
+        if (currentVoice === 0) return cursor.next();
+        var element = cursor.element;
+        var nextTick = cursor.tick + (element && element.actualDuration ? element.actualDuration.ticks : 0);
+        return nextTick < curScore.lastSegment.tick && cursor.moveToTick(nextTick);
     }
 
     function chordPitches(chord) {
@@ -1043,9 +1174,8 @@ MuseScore {
     function addTiedNote(params) {
         var validation = validateParams(params, ["duration", "advanceCursorAfterAction"]);
         if (!validation.valid) return validation;
-        if (!params.duration.numerator || !params.duration.denominator) {
-            return { error: "Duration must be specified as { numerator: int, denominator: int }" };
-        }
+        var durationError = noteValueError(params.duration);
+        if (durationError) return { error: durationError };
 
         return executeWithUndo(function() {
             syncStateToSelection();
@@ -1076,6 +1206,10 @@ MuseScore {
 
             var chordPitchList = pitches.slice();
             var extra = params.extraPitches || [];
+            for (var e = 0; e < extra.length; e++) {
+                var invalidExtra = pitchError(extra[e]);
+                if (invalidExtra) throw new Error(invalidExtra);
+            }
             for (var x = 0; x < extra.length; x++) {
                 if (chordPitchList.indexOf(extra[x]) < 0) chordPitchList.push(extra[x]);
             }
@@ -1115,35 +1249,41 @@ MuseScore {
         var validation = validateParams(params, ["duration", "advanceCursorAfterAction"]);
         if (!validation.valid) return validation;
 
-        if (!params.duration.numerator || !params.duration.denominator) {
-            return { error: "Duration must be specified as { numerator: int, denominator: int }" };
-        }
+        var durationError = noteValueError(params.duration);
+        if (durationError) return { error: durationError };
 
         return executeWithUndo(function() {
             syncStateToSelection();
             
             var cursor = createCursor();
+            if (!cursor.segment) {
+                throw new Error("The cursor is at the end of the score: append measures to write more");
+            }
             cursor.setDuration(params.duration.numerator, params.duration.denominator);
             cursor.addRest();
             cursor.rewindToTick(selectionState.startTick);
-
-            if (params.advanceCursorAfterAction) {
-                cursor.next();
-            }
-
-            var element = processElement(cursor.element);
-            var startTick = cursor.tick;
             var staffIdx = cursor.staffIdx;
 
             curScore.selection.clear();
-            curScore.selection.selectRange(startTick, startTick + element.durationTicks, staffIdx, staffIdx + 1);
+            if (params.advanceCursorAfterAction && !advanceCursor(cursor)) {
+                selectionState = { startStaff: staffIdx, endStaff: staffIdx + 1, startTick: curScore.lastSegment.tick, elements: [], totalDuration: 0 };
+                return { success: true, message: "Rest added; the cursor is at the end of the score (append measures to write more)", currentSelection: selectionState };
+            }
+
+            // In voices 2-4 there may be nothing yet where the cursor is now
+            var element = processElement(cursor.element);
+            var startTick = cursor.tick;
+            var durationTicks = element && element.durationTicks ? element.durationTicks : 0;
+            if (durationTicks > 0) {
+                curScore.selection.selectRange(startTick, startTick + durationTicks, staffIdx, staffIdx + 1);
+            }
 
             selectionState = {
                 startStaff: staffIdx,
                 endStaff: staffIdx + 1,
                 startTick: startTick,
-                elements: [element],
-                totalDuration: element.durationTicks
+                elements: element ? [element] : [],
+                totalDuration: durationTicks
             };
 
             return { success: true, message: "Rest added", currentSelection: selectionState };
@@ -1161,17 +1301,28 @@ MuseScore {
         
         return executeWithUndo(function() {
             var cursor = createCursor();
+            if (!cursor.segment) throw new Error("The cursor is at the end of the score: append measures to write more");
             cursor.setDuration(params.duration.numerator, params.duration.denominator);
             
             var ratio = fraction(params.ratio.numerator, params.ratio.denominator);
             var duration = fraction(params.duration.numerator, params.duration.denominator);
+            var tupletTick = cursor.tick;
+            var tupletTicks = Math.round(1920 * params.duration.numerator / params.duration.denominator);
             
             cursor.addTuplet(ratio, duration);
-            cursor.next();
-
-            if (params.advanceCursorAfterAction) {
-                cursor.next();
+            if (!cursor.element || !cursor.element.tuplet) {
+                throw new Error("MuseScore did not add the tuplet (it must fit into the measure)");
             }
+
+            // Without advancing, the cursor is on the tuplet's first note, so the next notes fill the tuplet;
+            // advancing skips the whole tuplet. (It moved one or two tuplet notes on, so the first note of a
+            // triplet went into its second slot.)
+            var target = params.advanceCursorAfterAction ? tupletTick + tupletTicks : tupletTick;
+            if (target >= curScore.lastSegment.tick) {
+                throw new Error("The tuplet ends the score: append measures to write after it");
+            }
+            // In voices 2-4, exactly there: the voice's next element may be measures away
+            if (!(currentVoice > 0 && cursor.moveToTick(target))) cursor.rewindToTick(target);
 
             var element = processElement(cursor.element);
             var startTick = cursor.tick;
@@ -1181,8 +1332,8 @@ MuseScore {
                 startStaff: staffIdx,
                 endStaff: staffIdx + 1,
                 startTick: startTick,
-                elements: [element],
-                totalDuration: element.durationTicks
+                elements: element ? [element] : [],
+                totalDuration: element ? element.durationTicks : 0
             };
 
             return { 
@@ -1386,12 +1537,22 @@ MuseScore {
         });
     }
 
+    // Cursor parameters for the start of a measure on the first staff, or undefined for the cursor position
+    function measureCursorParams(measure) {
+        if (measure === undefined || measure === null) return undefined;
+        var range = measureRange({ startMeasure: measure, startStaff: 0, endStaff: 1 });
+        if (!range.valid) return range;
+        return { startTick: range.startTick, startStaff: 0 };
+    }
+
     function setTimeSignature(params) {
         var validation = validateParams(params, ["numerator", "denominator"]);
         if (!validation.valid) return validation;
+        var cursorParams = measureCursorParams(params.measure);
+        if (cursorParams && cursorParams.error) return cursorParams;
         
         return executeWithUndo(function() {
-            var cursor = createCursor();
+            var cursor = createCursor(cursorParams);
             var currTick = cursor.tick;
             var currStaff = cursor.staffIdx;
 
@@ -1404,6 +1565,366 @@ MuseScore {
                 message: "Time signature set to " + params.numerator + "/" + params.denominator
             };
         });
+    }
+
+    // The key at the start of a measure, on all staves: each staff gets it in its own transposition
+    function setKeySignature(params) {
+        var validation = validateParams(params, ["fifths"]);
+        if (!validation.valid) return validation;
+        if (params.fifths < -7 || params.fifths > 7) return { error: "fifths must be between -7 (7 flats) and 7 (7 sharps)" };
+        var cursorParams = measureCursorParams(params.measure !== undefined && params.measure !== null ? params.measure : 1);
+        if (cursorParams.error) return cursorParams;
+
+        return executeWithUndo(function() {
+            var cursor = createCursor(cursorParams);
+            var keySig = newElement(Element.KEYSIG);
+            keySig.concertKey = params.fifths;
+            cursor.add(keySig);
+            return {
+                success: true,
+                message: "Key signature set to " + Math.abs(params.fifths) + (params.fifths < 0 ? " flat(s)" : " sharp(s)") +
+                         " (concert pitch) from measure " + (params.measure || 1)
+            };
+        });
+    }
+
+    // Chord symbols above a staff: params.chords is a list of { measure, beat (1-based, default 1), text },
+    // params.staff the staff (default 0). All are added as one undo step; nothing is added when one fails.
+    function addChordSymbols(params) {
+        if (!params || !params.chords || !params.chords.length) return { error: "No chords given" };
+        var staff = params.staff || 0;
+        if (staff < 0 || staff >= curScore.nstaves) return { error: "Invalid staff " + staff };
+
+        return executeWithUndo(function() {
+            var added = [];
+            for (var i = 0; i < params.chords.length; i++) {
+                var c = params.chords[i];
+                var m = getMeasure(c.measure);
+                if (!m) throw new Error("Invalid measure " + c.measure + " (score has " + curScore.nmeasures + " measures)");
+                var beat = c.beat || 1;
+                var tick = measureStartTick(m) + Math.round((beat - 1) * beatTicks(m));
+                if (tick >= measureEndTick(m)) throw new Error("Measure " + c.measure + " has no beat " + beat);
+
+                var cursor = createCursor({ startTick: tick, startStaff: staff });
+                // A chord symbol belongs to a note or rest of the staff: one must start on that beat
+                if (!cursor.segment || cursor.tick !== tick) {
+                    throw new Error("No note or rest starts on beat " + beat + " of measure " + c.measure + " in staff " + staff);
+                }
+                // Replace a chord symbol that is already there instead of stacking a second one
+                var annotations = cursor.segment.annotations || [];
+                for (var a = annotations.length - 1; a >= 0; a--) {
+                    if (annotations[a].type === Element.HARMONY && annotations[a].track === staff * 4) {
+                        removeElement(annotations[a]);
+                    }
+                }
+                var harmony = newElement(Element.HARMONY);
+                harmony.text = c.text;
+                cursor.add(harmony);
+                added.push("m." + c.measure + " beat " + beat + ": " + c.text);
+            }
+            return { success: true, message: "Added " + added.length + " chord symbol(s): " + added.join(", ") };
+        });
+    }
+
+    // The whole score, or only some measures, to another key: notes, key signatures and chord symbols
+    function transposeToKey(params) {
+        var validation = validateParams(params, ["keyFifths"]);
+        if (!validation.valid) return validation;
+        if (typeof curScore.transposeToKey !== "function") {
+            return { error: "This MuseScore cannot transpose from a plugin (needs MuseScore built from this project's branch)" };
+        }
+        var directions = { up: 0, down: 1, closest: 2 };
+        var direction = directions[params.direction || "closest"];
+        if (direction === undefined) return { error: "direction must be up, down or closest" };
+
+        var range = null;
+        if (params.startMeasure) {
+            range = measureRange({ startMeasure: params.startMeasure, endMeasure: params.endMeasure });
+            if (!range.valid) return range;
+        }
+        return executeWithUndo(function() {
+            curScore.selection.clear();
+            if (range) selectMeasureRange(range);
+            var ok = curScore.transposeToKey(params.keyFifths, direction, params.transposeKeySignatures !== false,
+                                             params.transposeChordSymbols !== false);
+            curScore.selection.clear();
+            if (!ok) throw new Error("MuseScore could not transpose all notes");
+            return { success: true, message: "Transposed " + (range ? "measures " + range.startMeasure + "-" + range.endMeasure : "the whole score") +
+                                             " to the key with " + Math.abs(params.keyFifths) + (params.keyFifths < 0 ? " flat(s)" : " sharp(s)") };
+        });
+    }
+
+    // ========================================
+    // EXPRESSION: dynamics, hairpins, slurs, hammer-ons/pull-offs, slides
+    // ========================================
+
+    // The tick of a beat (1-based, fractions allowed) in a measure (1-based); throws when there is none
+    function beatTick(measure, beat) {
+        var m = getMeasure(measure);
+        if (!m) throw new Error("Invalid measure " + measure + " (score has " + curScore.nmeasures + " measures)");
+        var tick = measureStartTick(m) + Math.round(((beat || 1) - 1) * beatTicks(m));
+        if (tick >= measureEndTick(m)) throw new Error("Measure " + measure + " has no beat " + beat);
+        return tick;
+    }
+
+    // The chord or rest starting at `tick` in a staff and voice (0-3, default 0); throws when none starts there
+    function chordRestAt(staff, tick, what, voice) {
+        var cursor = createCursor({ startTick: tick, startStaff: staff, voice: voice || 0 });
+        if (!cursor.segment || cursor.tick !== tick || !cursor.element) {
+            throw new Error("No note or rest starts at " + what + " in staff " + staff + (voice ? ", voice " + (voice + 1) : ""));
+        }
+        return cursor.element;
+    }
+
+    function chordAt(staff, tick, what, voice) {
+        var el = chordRestAt(staff, tick, what, voice);
+        if (el.type !== Element.CHORD) throw new Error("There is a rest, not a note, at " + what + " in staff " + staff);
+        return el;
+    }
+
+    function addDynamics(params) {
+        if (!params || !params.dynamics || !params.dynamics.length) return { error: "No dynamics given" };
+        return executeWithUndo(function() {
+            var added = [];
+            for (var i = 0; i < params.dynamics.length; i++) {
+                var d = params.dynamics[i];
+                var staff = d.staff || 0;
+                var what = "measure " + d.measure + " beat " + (d.beat || 1);
+                var type = DynamicType[String(d.dynamic || "").toUpperCase()];
+                if (type === undefined || String(d.dynamic).toUpperCase() === "OTHER") {
+                    throw new Error("Unknown dynamic " + JSON.stringify(d.dynamic) + " (e.g. pp, p, mp, mf, f, ff, sfz, fp)");
+                }
+                var tick = beatTick(d.measure, d.beat);
+                chordRestAt(staff, tick, what);
+                var cursor = createCursor({ startTick: tick, startStaff: staff });
+                var dynamic = newElement(Element.DYNAMIC);
+                dynamic.dynamicType = type;
+                cursor.add(dynamic);
+                added.push(what + ": " + d.dynamic);
+            }
+            return { success: true, message: "Added " + added.length + " dynamic(s): " + added.join(", ") };
+        });
+    }
+
+    // Lines over a range of notes, each up to and including the note at its end. MuseScore adds them to the
+    // selected range; a range selected while a command is open is applied only when it ends, so each line
+    // is selected first and then added in a command (an undo step) of its own.
+    function addLines(params) {
+        if (!params || !params.lines || !params.lines.length) return { error: "No lines given" };
+        if (!curScore) return { error: "No score open" };
+        var actions = {
+            crescendo: "add-hairpin",
+            diminuendo: "add-hairpin-reverse",
+            slur: "add-slur",
+            hammer_on_pull_off: "hammer-on-pull-off"
+        };
+        var added = [];
+        for (var i = 0; i < params.lines.length; i++) {
+            var line = params.lines[i];
+            var action = actions[line.kind];
+            var staff = line.staff || 0;
+            var voice = (line.voice || 1) - 1;
+            var label = line.kind + " from measure " + line.startMeasure + " beat " + (line.startBeat || 1) +
+                        " to measure " + line.endMeasure + " beat " + (line.endBeat || 1);
+            try {
+                if (!action) throw new Error("Unknown line kind " + JSON.stringify(line.kind) + " (crescendo, diminuendo, slur, hammer_on_pull_off)");
+                var startTick = beatTick(line.startMeasure, line.startBeat);
+                var endTick = beatTick(line.endMeasure, line.endBeat);
+                if (endTick <= startTick) throw new Error("The end must be after the start");
+                if (voice < 0 || voice > 3) throw new Error("voice must be 1 to 4");
+                var first = chordRestAt(staff, startTick, "measure " + line.startMeasure + " beat " + (line.startBeat || 1), voice);
+                var last = chordRestAt(staff, endTick, "measure " + line.endMeasure + " beat " + (line.endBeat || 1), voice);
+
+                curScore.selection.clear();
+                if (line.kind === "crescendo" || line.kind === "diminuendo") {
+                    // A hairpin belongs to the staff (one for all its voices): over the range
+                    var rangeEnd = endTick + last.actualDuration.ticks;
+                    if (!curScore.selection.selectRange(startTick, rangeEnd, staff, staff + 1)) throw new Error("MuseScore did not select the range");
+                } else {
+                    // MuseScore adds a slur to each voice of a selected range: select the voice's first and
+                    // last note instead, which gets one slur between them
+                    var notes = [first, last];
+                    for (var k = 0; k < notes.length; k++) {
+                        var el = notes[k];
+                        if (el.type !== Element.CHORD) throw new Error("A slur needs notes at both ends, not rests");
+                        curScore.selection.select(el.notes[el.notes.length - 1], k > 0);
+                    }
+                }
+                var before = curScore.spanners.length;
+                curScore.startCmd();
+                cmd(action);
+                curScore.endCmd();
+                curScore.selection.clear();
+                if (curScore.spanners.length <= before) throw new Error("MuseScore did not add it");
+                added.push(label);
+            } catch (e) {
+                curScore.selection.clear();
+                return {
+                    error: "Could not add the " + label + ": " + e.message + (added.length ? ". Added before it: " + added.join("; ") : ""),
+                    added: added
+                };
+            }
+        }
+        return { success: true, message: "Added " + added.length + " line(s): " + added.join("; ") };
+    }
+
+    function noteOfChord(chord, pitch, what) {
+        var notes = chord.notes;
+        if (pitch === undefined || pitch === null) return notes[notes.length - 1];  // the top note
+        for (var n = 0; n < notes.length; n++) if (notes[n].pitch === pitch) return notes[n];
+        throw new Error("No note with pitch " + pitch + " at " + what);
+    }
+
+    // Guitar slides: a straight glissando from one note to a later one of the same staff
+    function addSlides(params) {
+        if (!params || !params.slides || !params.slides.length) return { error: "No slides given" };
+        return executeWithUndo(function() {
+            var added = [];
+            for (var i = 0; i < params.slides.length; i++) {
+                var sl = params.slides[i];
+                var staff = sl.staff || 0;
+                var from = "measure " + sl.measure + " beat " + (sl.beat || 1);
+                var to = "measure " + sl.toMeasure + " beat " + (sl.toBeat || 1);
+                var voice = (sl.voice || 1) - 1;
+                var startNote = noteOfChord(chordAt(staff, beatTick(sl.measure, sl.beat), from, voice), sl.pitch, from);
+                var endNote = noteOfChord(chordAt(staff, beatTick(sl.toMeasure, sl.toBeat), to, voice), sl.toPitch, to);
+                if (!startNote.addGlissando(endNote, true)) {
+                    throw new Error("MuseScore did not add the slide from " + from + " to " + to + " (a note starts one slide at most)");
+                }
+                added.push(from + " to " + to);
+            }
+            return { success: true, message: "Added " + added.length + " slide(s): " + added.join("; ") };
+        });
+    }
+
+    // ========================================
+    // PLAYBACK: loop, play/stop, speed, mixer, voices
+    // ========================================
+
+    // These MuseScore actions are new in this project's branch: older MuseScores do not know them
+    function playbackAvailable() {
+        return typeof cmdWithArg === "function";
+    }
+
+    function playback(params, action, message) {
+        if (!curScore) return { error: "No score open" };
+        if (!playbackAvailable()) return { error: "Needs MuseScore built from this project's branch" };
+        cmd(action);
+        return { success: true, message: message };
+    }
+
+    // Loop playback over whole measures, or switch the loop off ({ off: true })
+    function setLoop(params) {
+        if (!curScore) return { error: "No score open" };
+        if (!playbackAvailable()) return { error: "Needs MuseScore built from this project's branch" };
+        if (params && params.off) {
+            cmd("loop-off");
+            return { success: true, message: "Loop off" };
+        }
+        var range = measureRange({ startMeasure: params.startMeasure, endMeasure: params.endMeasure });
+        if (!range.valid) return range;
+        // The range is selected outside a command, so that MuseScore sees it at once
+        curScore.selection.clear();
+        if (!curScore.selection.selectRange(range.startTick, range.endTick, 0, curScore.nstaves)) {
+            return { error: "MuseScore did not select measures " + range.startMeasure + "-" + range.endMeasure };
+        }
+        cmd("loop-selection");
+        curScore.selection.clear();
+        return { success: true, message: "Loop set to measures " + range.startMeasure + "-" + range.endMeasure + " and switched on" };
+    }
+
+    function setPlaybackSpeed(params) {
+        var validation = validateParams(params, ["percent"]);
+        if (!validation.valid) return validation;
+        if (!playbackAvailable()) return { error: "Needs MuseScore built from this project's branch" };
+        if (params.percent < 10 || params.percent > 300) return { error: "percent must be between 10 and 300" };
+        cmdWithArg("playback-set-tempo-multiplier", params.percent / 100);
+        return { success: true, message: "Playback at " + params.percent + "% of the tempo (the score's tempo markings are unchanged)" };
+    }
+
+    // The mixer channel of a staff's instrument: mute, solo, volume in dB (0 is the default level)
+    function setStaffMix(params) {
+        var validation = validateParams(params, ["staff"]);
+        if (!validation.valid) return validation;
+        if (!playbackAvailable()) return { error: "Needs MuseScore built from this project's branch" };
+        if (params.staff < 0 || params.staff >= curScore.nstaves) return { error: "Invalid staff " + params.staff };
+        var mix = { staff: params.staff };
+        var changed = [];
+        if (params.mute !== undefined && params.mute !== null) { mix.mute = params.mute; changed.push(params.mute ? "muted" : "unmuted"); }
+        if (params.solo !== undefined && params.solo !== null) { mix.solo = params.solo; changed.push(params.solo ? "solo" : "not solo"); }
+        if (params.volumeDb !== undefined && params.volumeDb !== null) {
+            if (params.volumeDb < -60 || params.volumeDb > 12) return { error: "volumeDb must be between -60 and 12" };
+            mix.volumeDb = params.volumeDb;
+            changed.push("volume " + params.volumeDb + " dB");
+        }
+        if (!changed.length) return { error: "Nothing to change: give mute, solo or volumeDb" };
+        cmdWithArg("playback-set-instrument-mix", mix);
+        return { success: true, message: "Staff " + params.staff + " (its instrument in the mixer): " + changed.join(", ") };
+    }
+
+    // The metronome: on or off, and its volume in dB (0 is the default level)
+    function setMetronome(params) {
+        if (!curScore) return { error: "No score open" };
+        if (!playbackAvailable()) return { error: "Needs MuseScore built from this project's branch" };
+        params = params || {};
+        var mix = { metronome: true };
+        var changed = [];
+        if (params.on !== undefined && params.on !== null) { mix.mute = !params.on; changed.push(params.on ? "on" : "off"); }
+        if (params.volumeDb !== undefined && params.volumeDb !== null) {
+            if (params.volumeDb < -60 || params.volumeDb > 12) return { error: "volumeDb must be between -60 and 12" };
+            mix.volumeDb = params.volumeDb;
+            changed.push("volume " + Math.round(params.volumeDb * 10) / 10 + " dB");
+        }
+        if (!changed.length) return { error: "Nothing to change: give on or volumeDb" };
+        cmdWithArg("playback-set-instrument-mix", mix);
+        return { success: true, message: "Metronome: " + changed.join(", ") };
+    }
+
+    // Whether a voice (1-4) of a staff plays back: an undoable staff property
+    function setVoicePlayback(params) {
+        var validation = validateParams(params, ["staff", "voice", "play"]);
+        if (!validation.valid) return validation;
+        if (!playbackAvailable()) return { error: "Needs MuseScore built from this project's branch" };
+        if (params.staff < 0 || params.staff >= curScore.nstaves) return { error: "Invalid staff " + params.staff };
+        if (params.voice < 1 || params.voice > 4) return { error: "voice must be 1 to 4" };
+        var result = executeWithUndo(function() {
+            curScore.staves[params.staff]["playbackVoice" + params.voice] = params.play === true;
+            return { success: true, message: "Voice " + params.voice + " of staff " + params.staff + (params.play ? " plays" : " is silent") };
+        });
+        if (result.success) cmd("playback-reload-cache");
+        return result;
+    }
+
+    function newScore(params) {
+        if (typeof createScore !== "function") {
+            return { error: "This MuseScore cannot create scores from a plugin (needs MuseScore built from this project's branch)" };
+        }
+        params = params || {};
+        var options = {
+            title: params.title || "",
+            composer: params.composer || "",
+            instruments: params.instruments || ["piano"],
+            keyFifths: params.keyFifths || 0,
+            timesigNumerator: params.timesigNumerator || 4,
+            timesigDenominator: params.timesigDenominator || 4,
+            tempoBpm: params.tempoBpm || 0,
+            measures: params.measures || 16
+        };
+        if (params.pickupNumerator) {
+            options.pickupNumerator = params.pickupNumerator;
+            options.pickupDenominator = params.pickupDenominator || 4;
+        }
+        var score = createScore(options);
+        if (!score) {
+            return { error: "The score was not created: an unknown instrument id, or closing the current score was cancelled" };
+        }
+        initCursorState();
+        return {
+            success: true,
+            message: "Created a score with " + curScore.nmeasures + " measures and " + curScore.nstaves + " staves",
+            numMeasures: curScore.nmeasures,
+            numStaves: curScore.nstaves
+        };
     }
 
     function setTempo(params) {
@@ -1420,14 +1941,45 @@ MuseScore {
         return executeWithUndo(function() {
             var cursor = createCursor(cursorParams);
 
+            // A second marking on the same beat would leave the tempo to chance: change the one that is there
+            var existing = findTempoText(cursor.segment);
+            if (existing) {
+                // The marking may count another beat unit (e.g. a dotted quarter): keep its unit and its words
+                var shown = tempoTextNumber(existing.text);
+                if (shown !== null && existing.tempo > 0) {
+                    var perQuarter = shown / (existing.tempo * 60.0);
+                    var number = Math.round(params.bpm * perQuarter * 100) / 100;
+                    existing.text = existing.text.replace(/=(\s*)\d+(?:[.,]\d+)?/, "=$1" + number);
+                } else {
+                    existing.text = "<sym>metNoteQuarterUp</sym> = " + params.bpm;
+                }
+                existing.tempo = params.bpm / 60.0;
+                return { success: true, message: "Tempo changed to " + params.bpm + " BPM (existing marking updated)" };
+            }
+
             var tempo = newElement(Element.TEMPO_TEXT);
             tempo.tempo = params.bpm / 60.0;
-            tempo.text = "♩ = " + params.bpm;
-            
+            tempo.text = "<sym>metNoteQuarterUp</sym> = " + params.bpm;
+
             cursor.add(tempo);
-            
+
             return { success: true, message: "Tempo set to " + params.bpm + " BPM" };
         });
+    }
+
+    function findTempoText(segment) {
+        if (!segment) return null;
+        var annotations = segment.annotations || [];
+        for (var a = 0; a < annotations.length; a++) {
+            if (annotations[a].type === Element.TEMPO_TEXT) return annotations[a];
+        }
+        return null;
+    }
+
+    // The number after "=" in a tempo marking, e.g. 60 in "Moderato <sym>metNoteQuarterUp</sym> = 60"
+    function tempoTextNumber(text) {
+        var match = /=\s*(\d+(?:[.,]\d+)?)/.exec(text || "");
+        return match ? parseFloat(match[1].replace(",", ".")) : null;
     }
 
     // ========================================
@@ -1995,7 +2547,7 @@ MuseScore {
         var kinds = params.kinds && params.kinds.length ? params.kinds : ["texts"];
         var contains = params.contains || "";
         var exact = params.exact === true;
-        var removed = { texts: 0, labels: 0, rehearsal_marks: 0, tempo: 0, voltas: 0 };
+        var removed = { texts: 0, labels: 0, rehearsal_marks: 0, tempo: 0, voltas: 0, hairpins: 0 };
         var targets = [];
 
         forEachMarking(range, ["StaffText", "Expression", "RehearsalMark", "Tempo", "TempoText"], function(ann) {
@@ -2017,6 +2569,20 @@ MuseScore {
                 if (sp.name === "Volta" && tick >= range.startTick && tick < range.endTick) {
                     targets.push(sp);
                     removed.voltas++;
+                }
+            }
+        }
+        // Crescendo and diminuendo hairpins starting in the range, on its staves
+        if (kinds.indexOf("hairpins") !== -1) {
+            var allSpanners = curScore.spanners || [];
+            for (var h = 0; h < allSpanners.length; h++) {
+                var hp = allSpanners[h];
+                var hpTick = hp.spannerTick ? hp.spannerTick.ticks : -1;
+                var hpStaff = Math.floor(hp.track / 4);
+                if (hp.name === "HairPin" && hpTick >= range.startTick && hpTick < range.endTick &&
+                    hpStaff >= range.startStaff && hpStaff < range.endStaff) {
+                    targets.push(hp);
+                    removed.hairpins++;
                 }
             }
         }
@@ -2836,6 +3402,7 @@ MuseScore {
                         entry.markings.push({
                             name: ann.name,
                             text: typeof ann.subtypeName === "function" && ann.name === "Dynamic" ? ann.subtypeName()
+                                  : ann.name === "Harmony" && typeof ann.harmonyName === "function" ? ann.harmonyName()
                                   : String(ann.text || "").replace(/<[^>]*>/g, ""),
                             staff: annStaff,
                             startTick: seg.tick,
@@ -2855,6 +3422,7 @@ MuseScore {
     // ========================================
 
     onRun: {
+        startedAt = Date.now();
         console.log("Starting MuseScore API Server (Clean Version) on port 8765");
         
         api.websocketserver.listen(8765, function(clientId) {

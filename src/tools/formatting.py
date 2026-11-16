@@ -460,7 +460,7 @@ def setup_formatting_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
         description=(
             "Remove texts and marks from a range of bars, e.g. to redo part of a chart. kinds: 'texts' (add_text: "
             "cues, '*' marks, legends), 'labels' (boxed add_label texts), 'rehearsal_marks', 'tempo' (tempo "
-            "markings, which also changes playback), 'voltas'. `contains` limits it to texts containing that string, "
+            "markings, which also changes playback), 'voltas', 'hairpins' (crescendo/diminuendo starting in the range). `contains` limits it to texts containing that string, "
             "e.g. '**'. Defaults to the whole score. Highlights and note colors are removed with clear_highlights / "
             "clear_color instead."
         ),
@@ -479,7 +479,14 @@ def setup_formatting_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
         ] = None,
         kinds: Annotated[
             List[
-                Literal["texts", "labels", "rehearsal_marks", "tempo", "voltas"]
+                Literal[
+                    "texts",
+                    "labels",
+                    "rehearsal_marks",
+                    "tempo",
+                    "voltas",
+                    "hairpins",
+                ]
             ],
             "What to remove",
         ] = ["texts"],

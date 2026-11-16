@@ -109,7 +109,9 @@ def setup_navigation_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
         description=(
             "Navigate to a specific measure and select it across all staves. The cursor moves to beat 1 "
             "of that measure on the first staff, so the next cursor tool (add_note, add_rest, add_lyrics, "
-            "set_time_signature...) acts there; use next_staff to move down to another staff."
+            "set_time_signature...) acts there; use next_staff to move down to another staff. The note tools "
+            "write in the given voice: voice 2 for a second, independent line on the same staff (stems down), "
+            "e.g. a bass under a melody."
         ),
         tags={"navigation"},
     )
@@ -118,8 +120,26 @@ def setup_navigation_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
             int,
             "Measure number (1-based, must not exceed the number of measures in the score)",
         ],
+        voice: Annotated[
+            int, "Voice (1-4) the note tools write in from here"
+        ] = 1,
     ):
-        return await _run_and_convert("goToMeasure", {"measure": measure})
+        return await _run_and_convert(
+            "goToMeasure", {"measure": measure, "voice": voice}
+        )
+
+    @mcp.tool(
+        description=(
+            "Switch the voice (1-4) the note tools (add_note, add_rest, add_tuplet...) write in, at the "
+            "cursor's position and staff. Voice 1 has stems up, voice 2 stems down: two independent lines "
+            "on one staff, e.g. melody and bass for guitar or piano. go_to_measure also sets the voice."
+        ),
+        tags={"navigation"},
+    )
+    async def set_voice(
+        voice: Annotated[int, "Voice 1 to 4"],
+    ):
+        return await client.request("setVoice", {"voice": voice})
 
     @mcp.tool(
         description="Navigate to the final measure of the score.",

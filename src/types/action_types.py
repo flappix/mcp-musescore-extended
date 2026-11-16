@@ -118,6 +118,16 @@ class getCursorInfoAction(TypedDict):
 
 class goToMeasureParams(TypedDict):
     measure: int
+    voice: NotRequired[int]
+
+
+class setVoiceParams(TypedDict):
+    voice: int
+
+
+class setVoiceAction(TypedDict):
+    action: Literal["setVoice"]
+    params: setVoiceParams
 
 
 class goToMeasureAction(TypedDict):
@@ -505,6 +515,7 @@ ActionSequence = List[
     | deleteSelectionAction
     | getCursorInfoAction
     | goToMeasureAction
+    | setVoiceAction
     | nextElementAction
     | prevElementAction
     | selectCurrentMeasureAction

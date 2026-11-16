@@ -9,9 +9,11 @@ from fastmcp import FastMCP
 from src.client import MuseScoreClient
 from src.tools import (
     setup_connection_tools,
+    setup_expression_tools,
     setup_formatting_tools,
     setup_navigation_tools,
     setup_notes_measures_tools,
+    setup_playback_tools,
     setup_score_file_tools,
     setup_sequence_tools,
     setup_staff_instruments_tools,
@@ -38,6 +40,8 @@ setup_navigation_tools(mcp, client)
 setup_notes_measures_tools(mcp, client)
 setup_staff_instruments_tools(mcp, client)
 setup_time_tempo_tools(mcp, client)
+setup_expression_tools(mcp, client)
+setup_playback_tools(mcp, client)
 setup_sequence_tools(mcp, client)
 setup_viewer_tools(mcp, client)
 setup_structure_tools(mcp, client)

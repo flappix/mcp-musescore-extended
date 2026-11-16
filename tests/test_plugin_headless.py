@@ -298,6 +298,7 @@ def test_added_texts_and_marks_can_be_removed():
         "rehearsal_marks": 1,
         "tempo": 1,
         "voltas": 1,
+        "hairpins": 0,
     }
     assert not any(
         m["markings"] for m in results[8]["result"]["analysis"]["measures"]
@@ -1202,11 +1203,6 @@ def test_append_measure_adds_measures_at_the_end(tmp_path):
     assert results[-1]["result"]["analysis"]["numMeasures"] == 5
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="B7: MuseScore does not see the plugin's selection, so it refuses "
-    "insert-measure ('no one can handle the action')",
-)
 def test_insert_measure_goes_before_the_selected_measure(tmp_path):
     results = run(
         [
@@ -1249,11 +1245,6 @@ def test_delete_selection_turns_the_notes_into_rests(tmp_path):
     assert first and all(e["name"] == "Rest" for e in first)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="B8: MuseScore does not see the selection go_to_measure makes, so it "
-    "refuses the delete ('no one can handle the action')",
-)
 def test_delete_selection_after_go_to_measure(tmp_path):
     results = run(
         [
@@ -1280,3 +1271,588 @@ def test_next_element_onto_the_last_note_appends_a_measure(tmp_path):
     )
     assert results[1]["result"].get("success")
     assert results[-1]["result"]["analysis"]["numMeasures"] == 3
+
+
+def mscx_text(path):
+    with zipfile.ZipFile(path) as z:
+        name = next(
+            n for n in z.namelist() if n.endswith(".mscx") and "/" not in n
+        )
+        return z.read(name).decode("utf-8")
+
+
+def quarter(pitch, advance=True):
+    return {
+        "action": "addNote",
+        "params": {
+            "pitch": pitch,
+            "duration": {"numerator": 1, "denominator": 4},
+            "advanceCursorAfterAction": advance,
+        },
+    }
+
+
+def test_chord_symbols_are_parsed_and_replace_one_on_the_same_beat(tmp_path):
+    out = tmp_path / "out.mscz"
+    results = results_by_action(
+        run(
+            [
+                {
+                    "action": "addChordSymbols",
+                    "params": {
+                        "chords": [
+                            {"measure": 1, "text": "Am"},
+                            {"measure": 2, "text": "F#dim"},
+                            {"measure": 1, "text": "Em"},
+                        ]
+                    },
+                }
+            ],
+            JAZZ,
+            out=out,
+        )
+    )
+    assert results["addChordSymbols"]["success"]
+    xml = mscx_text(out)
+    # Parsed into chords (root as tonal pitch class: E = 18, F# = 20), not plain text
+    assert xml.count("<Harmony>") == 2
+    assert "<root>18</root>" in xml and "<root>20</root>" in xml
+
+
+def test_key_signature_is_set_on_every_staff(tmp_path):
+    out = tmp_path / "out.mscz"
+    run(
+        [{"action": "setKeySignature", "params": {"fifths": -2, "measure": 3}}],
+        JAZZ,
+        out=out,
+    )
+    assert mscx_text(out).count("<concertKey>-2</concertKey>") == 2
+
+
+def test_tempo_changes_the_marking_that_is_already_there(tmp_path):
+    out = tmp_path / "out.mscz"
+    results = run(
+        [
+            {"action": "setTempo", "params": {"bpm": 60, "measure": 2}},
+            {"action": "setTempo", "params": {"bpm": 90, "measure": 2}},
+        ],
+        JAZZ,
+        out=out,
+    )
+    assert "existing marking updated" in results[1]["result"]["message"]
+    xml = mscx_text(out)
+    assert xml.count("<Tempo>") == 1
+    assert "<tempo>1.5</tempo>" in xml
+
+
+def test_notes_into_the_last_measure_stay_on_their_staff():
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 7}},
+            {"action": "nextStaff", "params": {}},
+            quarter(45),
+            quarter(47),
+            quarter(48),
+            quarter(40),
+            {
+                "action": "getScore",
+                "params": {"startMeasure": 7, "endMeasure": 8},
+            },
+        ],
+        JAZZ,
+    )
+    measures = results_by_action(results)["getScore"]["analysis"]["measures"]
+    lower = [
+        [n["pitchMidi"] for n in e["notes"]]
+        for m in measures
+        for e in m["elements"]["staff1"]
+    ]
+    assert lower[:4] == [[45], [47], [48], [40]]
+    # The upper staff is untouched: its last measure still holds one long note
+    assert len(measures[1]["elements"]["staff0"]) == 1
+    assert all("corrupted" not in entry for entry in results)
+
+
+def test_a_note_past_the_end_of_the_score_is_refused():
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 8}},
+            {
+                "action": "addNote",
+                "params": {
+                    "pitch": 40,
+                    "duration": {"numerator": 3, "denominator": 4},
+                    "advanceCursorAfterAction": True,
+                },
+            },
+            quarter(43),
+        ],
+        JAZZ,
+    )
+    assert "end of the score" in results[1]["result"]["message"]
+    assert "end of the score" in results[2]["result"]["error"]
+
+
+def test_a_sequence_stops_at_the_first_failed_step():
+    results = run(
+        [
+            {
+                "action": "processSequence",
+                "params": {
+                    "sequence": [
+                        {"action": "goToMeasure", "params": {"measure": 2}},
+                        {"action": "prevStaff", "params": {}},
+                        quarter(40),
+                    ]
+                },
+            },
+            {
+                "action": "getScore",
+                "params": {"startMeasure": 2, "endMeasure": 2},
+            },
+        ],
+        JAZZ,
+    )
+    assert "Step 2 (prevStaff) failed" in results[0]["result"]["error"]
+    staff0 = results[1]["result"]["analysis"]["measures"][0]["elements"][
+        "staff0"
+    ]
+    assert 40 not in [n["pitchMidi"] for e in staff0 for n in e["notes"]]
+
+
+def test_transpose_to_key_moves_notes_keys_and_chord_symbols(tmp_path):
+    out = tmp_path / "out.mscz"
+    results = run(
+        [
+            {"action": "setKeySignature", "params": {"fifths": 1}},
+            {
+                "action": "addChordSymbols",
+                "params": {"chords": [{"measure": 1, "text": "Em"}]},
+            },
+            {"action": "getScore", "params": {"startMeasure": 1}},
+            {"action": "transposeToKey", "params": {"keyFifths": -3}},
+            {"action": "getScore", "params": {"startMeasure": 1}},
+        ],
+        JAZZ,
+        out=out,
+    )
+
+    def first_measure(entry):
+        m = entry["result"]["analysis"]["measures"][0]
+        pitches = [
+            n["pitchMidi"] for e in m["elements"]["staff0"] for n in e["notes"]
+        ]
+        return pitches, [mk.get("text") for mk in m["markings"]]
+
+    before, _ = first_measure(results[2])
+    after, chords = first_measure(results[4])
+    # E minor to C minor, closest: a major third down
+    assert after == [p - 4 for p in before]
+    assert chords == ["Cm"]
+    assert mscx_text(out).count("<concertKey>-3</concertKey>") == 2
+
+
+def test_add_note_reports_the_position_after_the_note():
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 7}},
+            {"action": "nextStaff", "params": {}},
+            quarter(45),
+            quarter(47),
+            quarter(48),
+        ],
+        JAZZ,
+    )
+    positions = [
+        (
+            r["result"]["currentSelection"]["startStaff"],
+            r["result"]["currentSelection"]["startTick"],
+        )
+        for r in results[2:]
+    ]
+    # Measure 7 starts at tick 8640; a quarter is 480 ticks
+    assert positions == [(1, 9120), (1, 9600), (1, 10080)]
+
+
+def test_chord_symbols_imported_from_musicxml_have_their_names(tmp_path):
+    exported = tmp_path / "chords.mxl"
+    run(
+        [
+            {
+                "action": "addChordSymbols",
+                "params": {
+                    "chords": [
+                        {"measure": 1, "text": "Am7"},
+                        {"measure": 2, "text": "Bb/D"},
+                    ]
+                },
+            },
+            {"action": "exportScore", "params": {"path": str(exported)}},
+        ],
+        JAZZ,
+    )
+    results = run(
+        [
+            {
+                "action": "getScore",
+                "params": {"startMeasure": 1, "endMeasure": 2},
+            }
+        ],
+        exported,
+    )
+    measures = results[0]["result"]["analysis"]["measures"]
+    names = [
+        mk["text"]
+        for m in measures
+        for mk in m["markings"]
+        if mk["name"] == "Harmony"
+    ]
+    assert names == ["Am7", "Bb/D"]
+
+
+@pytest.mark.parametrize(
+    "pitch, duration, message",
+    [
+        (200, (1, 4), "Invalid pitch"),
+        (60.5, (1, 4), "Invalid pitch"),
+        (60, (1, 3), "no note value"),
+        (60, (5, 8), "no note value"),
+    ],
+)
+def test_add_note_refuses_what_musescore_would_ignore(pitch, duration, message):
+    results = run(
+        [
+            {
+                "action": "addNote",
+                "params": {
+                    "pitch": pitch,
+                    "duration": {
+                        "numerator": duration[0],
+                        "denominator": duration[1],
+                    },
+                    "advanceCursorAfterAction": True,
+                },
+            }
+        ],
+        JAZZ,
+    )
+    assert message in results[0]["result"]["error"]
+
+
+def test_add_note_writes_a_dotted_note():
+    results = run(
+        [
+            {
+                "action": "addNote",
+                "params": {
+                    "pitch": 60,
+                    "duration": {"numerator": 3, "denominator": 8},
+                    "advanceCursorAfterAction": True,
+                },
+            }
+        ],
+        JAZZ,
+    )
+    assert results[0]["result"]["success"]
+
+
+def test_dynamics_lines_and_slides_are_added(tmp_path):
+    out = tmp_path / "out.mscz"
+    results = run(
+        [
+            {
+                "action": "addDynamics",
+                "params": {
+                    "dynamics": [
+                        {"measure": 1, "dynamic": "p"},
+                        {"measure": 3, "dynamic": "mf"},
+                    ]
+                },
+            },
+            {
+                "action": "addLines",
+                "params": {
+                    "lines": [
+                        {
+                            "kind": "crescendo",
+                            "startMeasure": 1,
+                            "endMeasure": 2,
+                        },
+                        {
+                            "kind": "diminuendo",
+                            "startMeasure": 3,
+                            "endMeasure": 4,
+                        },
+                        {
+                            "kind": "slur",
+                            "startMeasure": 1,
+                            "endMeasure": 1,
+                            "endBeat": 2,
+                        },
+                        {
+                            "kind": "hammer_on_pull_off",
+                            "startMeasure": 2,
+                            "startBeat": 2,
+                            "endMeasure": 2,
+                            "endBeat": 2.5,
+                        },
+                    ]
+                },
+            },
+            {
+                "action": "addSlides",
+                "params": {
+                    "slides": [{"measure": 1, "beat": 3, "toMeasure": 2}]
+                },
+            },
+        ],
+        JAZZ,
+        out=out,
+    )
+    assert all(r["result"].get("success") for r in results), results
+    xml = mscx_text(out)
+    # MuseScore saves a dynamic's standard text as its subtype only
+    assert xml.count("<Dynamic>") == 2
+    assert "<subtype>p</subtype>" in xml and "<subtype>mf</subtype>" in xml
+    assert xml.count('<Spanner type="HairPin">') >= 2
+    assert '<Spanner type="Slur">' in xml
+    assert '<Spanner type="HammerOnPullOff">' in xml
+    assert '<Spanner type="Glissando">' in xml
+
+
+def test_a_line_that_cannot_be_placed_is_reported():
+    results = run(
+        [
+            {
+                "action": "addLines",
+                "params": {
+                    "lines": [
+                        {
+                            "kind": "slur",
+                            "startMeasure": 1,
+                            "endMeasure": 1,
+                            "endBeat": 1.25,
+                        }
+                    ]
+                },
+            }
+        ],
+        JAZZ,
+    )
+    assert "No note or rest starts" in results[0]["result"]["error"]
+
+
+def test_notes_after_add_tuplet_fill_the_tuplet_from_its_first_note():
+    def note(pitch, n, d):
+        return {
+            "action": "addNote",
+            "params": {
+                "pitch": pitch,
+                "duration": {"numerator": n, "denominator": d},
+                "advanceCursorAfterAction": True,
+            },
+        }
+
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 1}},
+            note(60, 1, 4),
+            {
+                "action": "addTuplet",
+                "params": {
+                    "duration": {"numerator": 1, "denominator": 4},
+                    "ratio": {"numerator": 3, "denominator": 2},
+                    "advanceCursorAfterAction": False,
+                },
+            },
+            note(64, 1, 8),
+            note(67, 1, 8),
+            note(72, 1, 8),
+            note(71, 1, 4),
+            {
+                "action": "getScore",
+                "params": {"startMeasure": 1, "endMeasure": 1, "staves": [0]},
+            },
+        ],
+        JAZZ,
+    )
+    elements = results[-1]["result"]["analysis"]["measures"][0]["elements"][
+        "staff0"
+    ]
+    assert [
+        (e["startTick"], e["isTuplet"], [n["pitchMidi"] for n in e["notes"]])
+        for e in elements
+    ] == [
+        (0, False, [60]),
+        (480, True, [64]),
+        (640, True, [67]),
+        (800, True, [72]),
+        (960, False, [71]),
+    ]
+
+
+def test_hairpins_can_be_removed(tmp_path):
+    out = tmp_path / "out.mscz"
+    results = run(
+        [
+            {
+                "action": "addLines",
+                "params": {
+                    "lines": [
+                        {
+                            "kind": "crescendo",
+                            "startMeasure": 1,
+                            "endMeasure": 2,
+                        },
+                        {
+                            "kind": "diminuendo",
+                            "startMeasure": 3,
+                            "endMeasure": 4,
+                        },
+                    ]
+                },
+            },
+            {
+                "action": "removeAnnotations",
+                "params": {
+                    "startMeasure": 1,
+                    "endMeasure": 1,
+                    "kinds": ["hairpins"],
+                },
+            },
+        ],
+        JAZZ,
+        out=out,
+    )
+    assert results[1]["result"]["removed"]["hairpins"] == 1
+    assert (
+        mscx_text(out).count('<Spanner type="HairPin">') == 2
+    )  # start and end tag of the one left
+
+
+def test_a_second_voice_is_written_under_the_first():
+    def note(pitch, n, d):
+        return {
+            "action": "addNote",
+            "params": {
+                "pitch": pitch,
+                "duration": {"numerator": n, "denominator": d},
+                "advanceCursorAfterAction": True,
+            },
+        }
+
+    results = run(
+        [
+            {
+                "action": "getScore",
+                "params": {"startMeasure": 1, "endMeasure": 3, "staves": [0]},
+            },
+            {"action": "goToMeasure", "params": {"measure": 1, "voice": 2}},
+            note(48, 1, 2),
+            note(50, 1, 4),
+            note(52, 3, 4),  # fills measure 2, where voice 2 had nothing
+            note(53, 1, 4),
+            {
+                "action": "getScore",
+                "params": {"startMeasure": 1, "endMeasure": 3, "staves": [0]},
+            },
+        ],
+        JAZZ,
+    )
+
+    def voice(entry, v):
+        return [
+            (e["startTick"], [n["pitchMidi"] for n in e.get("notes", [])])
+            for m in entry["result"]["analysis"]["measures"]
+            for e in m["elements"]["staff0"]
+            if e.get("voice") == v and e["name"] == "Chord"
+        ]
+
+    assert voice(results[-1], 1) == [
+        (0, [48]),
+        (960, [50]),
+        (1440, [52]),
+        (2880, [53]),
+    ]
+    assert voice(results[-1], 0) == voice(
+        results[0], 0
+    )  # the first voice is unchanged
+    assert all("corrupted" not in r for r in results)
+
+
+def test_slurs_and_hammer_ons_belong_to_one_voice(tmp_path):
+    import re
+
+    out = tmp_path / "out.mscz"
+
+    def note(pitch):
+        return {
+            "action": "addNote",
+            "params": {
+                "pitch": pitch,
+                "duration": {"numerator": 1, "denominator": 4},
+                "advanceCursorAfterAction": True,
+            },
+        }
+
+    run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 1, "voice": 2}},
+            note(48),
+            note(50),
+            note(52),
+            {
+                "action": "addLines",
+                "params": {
+                    "lines": [
+                        {
+                            "kind": "slur",
+                            "startMeasure": 1,
+                            "endMeasure": 1,
+                            "endBeat": 2,
+                        },
+                        {
+                            "kind": "hammer_on_pull_off",
+                            "startMeasure": 1,
+                            "startBeat": 2,
+                            "endMeasure": 1,
+                            "endBeat": 3,
+                            "voice": 2,
+                        },
+                    ]
+                },
+            },
+        ],
+        JAZZ,
+        out=out,
+    )
+    voices = mscx_text(out).split("<Measure>")[1].split("<voice>")[1:]
+
+    def starts(kind, voice):
+        return len(re.findall(rf'<Spanner type="{kind}">\s*<{kind}>', voice))
+
+    assert (starts("Slur", voices[0]), starts("Slur", voices[1])) == (1, 0)
+    assert (
+        starts("HammerOnPullOff", voices[0]),
+        starts("HammerOnPullOff", voices[1]),
+    ) == (0, 1)
+
+
+def test_voice_playback_is_switched_off_and_saved(tmp_path):
+    out = tmp_path / "out.mscz"
+    results = run(
+        [
+            {
+                "action": "setVoicePlayback",
+                "params": {"staff": 1, "voice": 2, "play": False},
+            }
+        ],
+        JAZZ,
+        out=out,
+    )
+    assert results[0]["result"]["success"]
+    # The part's staff definitions: only the second staff's second voice is silent
+    part = mscx_text(out).split("<Part id=")[1].split("</Part>")[0]
+    staves = part.split("<Staff>")[1:]
+    assert "<playbackVoice2>0</playbackVoice2>" in staves[1]
+    assert "playbackVoice2" not in staves[0]

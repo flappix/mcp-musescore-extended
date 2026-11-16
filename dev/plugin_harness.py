@@ -5,7 +5,9 @@ This needs neither the GUI nor the WebSocket bridge.
 Builds a copy of musescore-mcp-websocket.qml whose onRun executes a fixed list of commands,
 runs it on a score with MuseScore's converter (`--extension`), and prints each command's result.
 MuseScore runs from a throwaway profile in a temporary folder, so your own settings and
-plugins are not touched.
+plugins are not touched. On macOS, where MuseScore ignores $HOME, the profile of the tested
+build is used instead ($MUSESCORE_PROFILE, default MuseScore4Development, the profile of a
+self-built MuseScore) and restored afterwards.
 
 ```
 python dev/plugin_harness.py '[{"action": "getScore", "params": {"startMeasure": 1, "endMeasure": 2}}]' \
@@ -18,6 +20,7 @@ exactly what the Python server sends over the WebSocket. Results are passed back
 """
 
 import argparse
+import contextlib
 import glob
 import json
 import os
@@ -28,7 +31,16 @@ import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 PLUGIN = REPO / "musescore-mcp-websocket.qml"
@@ -104,7 +116,13 @@ def build_harness(
                     result = processCommand(commands[i]);
                 }}
             }} catch (e) {{ result = {{ error: e.toString() }}; }}
-            results.push({{ action: commands[i].action, result: result }});
+            var entry = {{ action: commands[i].action, result: result }};
+            // MuseScore 4.7 built from this project's branch: report a corrupted score after each command
+            if (typeof curScore.checkConsistency === "function") {{
+                var problems = curScore.checkConsistency();
+                if (problems) entry.corrupted = problems;
+            }}
+            results.push(entry);
         }}
         curScore.startCmd();
         curScore.setMetaTag("harness", JSON.stringify(results));
@@ -171,27 +189,26 @@ def refused_actions(log_text: str, unknown_only: bool = False) -> List[str]:
 
 
 def _musescore(
-    binary: str, args: List[str], home: Path, timeout: float
+    binary: str, args: List[str], home: Optional[Path], timeout: float
 ) -> subprocess.CompletedProcess[str]:
     """Run MuseScore offscreen, with a throwaway home folder.
 
     Args:
         binary (str): The MuseScore executable.
         args (List[str]): Its command-line arguments.
-        home (Path): The home folder to use, for MuseScore's settings.
+        home (Optional[Path]): The home folder to use, for MuseScore's
+            settings; None keeps the real one.
         timeout (float): The time limit in seconds.
 
     Returns:
         proc (subprocess.CompletedProcess[str]): The finished process, with its
             output.
     """
-    env = {
-        **os.environ,
-        "HOME": str(home),
-        "XDG_CONFIG_HOME": str(home / ".config"),
-        "XDG_DATA_HOME": str(home / ".local" / "share"),
-        "QT_QPA_PLATFORM": "offscreen",
-    }
+    env = {**os.environ, "QT_QPA_PLATFORM": "offscreen"}
+    if home is not None:
+        env["HOME"] = str(home)
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        env["XDG_DATA_HOME"] = str(home / ".local" / "share")
     return subprocess.run(
         [binary, *args],
         env=env,
@@ -199,6 +216,86 @@ def _musescore(
         capture_output=True,
         text=True,
     )
+
+
+@contextlib.contextmanager
+def _profile(
+    tmp: Path,
+) -> Generator[
+    Tuple[Optional[Path], Path, Path, Callable[[], List[str]]], None, None
+]:
+    """Provide the MuseScore profile folders the harness writes into.
+
+    On Linux, MuseScore follows $HOME, so the profile is a throwaway one in
+    tmp. On macOS, Qt ignores $HOME, so the real profile of the tested build
+    is used: $MUSESCORE_PROFILE, by default MuseScore4Development (the name a
+    self-built MuseScore uses). Its extensions/config.json is restored and the
+    harness plugin removed afterwards.
+
+    Args:
+        tmp (Path): A temporary folder for the throwaway profile.
+
+    Yields:
+        profile (Tuple[Optional[Path], Path, Path, Callable[[], List[str]]]):
+            The home folder to run MuseScore with (None: the real one), the
+            plugins folder, the extensions folder, and a function returning
+            what MuseScore logged during the run.
+    """
+    if sys.platform != "darwin":
+        home = tmp / "home"
+        plugins = home / "Documents" / "MuseScore4" / "Plugins"
+        extensions = (
+            home
+            / ".local"
+            / "share"
+            / "MuseScore"
+            / "MuseScore4"
+            / "extensions"
+        )
+        plugins.mkdir(parents=True)
+        extensions.mkdir(parents=True)
+        # ~/.local/share/... for an AppImage, ~/.var/app/... for a Flatpak
+        yield (
+            home,
+            plugins,
+            extensions,
+            lambda: [
+                log.read_text(errors="replace")
+                for log in home.rglob("MuseScore_*.log")
+            ],
+        )
+        return
+
+    name = os.environ.get("MUSESCORE_PROFILE", "MuseScore4Development")
+    data = Path.home() / "Library" / "Application Support" / "MuseScore" / name
+    plugins = Path.home() / "Documents" / name / "Plugins"
+    extensions = data / "extensions"
+    plugins.mkdir(parents=True, exist_ok=True)
+    extensions.mkdir(parents=True, exist_ok=True)
+    config = extensions / "config.json"
+    saved = config.read_bytes() if config.exists() else None
+    # Log files are named to the second: a run that starts in the same second
+    # as the one before continues its file. So only what was added is read.
+    sizes = {
+        log: log.stat().st_size for log in data.glob("logs/MuseScore_*.log")
+    }
+
+    def logged() -> List[str]:
+        texts = []
+        for log in data.glob("logs/MuseScore_*.log"):
+            with log.open("rb") as f:
+                f.seek(sizes.get(log, 0))
+                texts.append(f.read().decode("utf-8", errors="replace"))
+        return texts
+
+    try:
+        yield None, plugins, extensions, logged
+    finally:
+        (plugins / HARNESS_NAME).unlink(missing_ok=True)
+        if saved is None:
+            config.unlink(missing_ok=True)
+        else:
+            config.write_bytes(saved)
 
 
 def run(
@@ -242,20 +339,11 @@ def run(
     if not binary:
         raise RuntimeError("MuseScore not found: set MUSESCORE_BIN")
 
-    with tempfile.TemporaryDirectory(prefix="mcp-harness-") as tmp:
+    with (
+        tempfile.TemporaryDirectory(prefix="mcp-harness-") as tmp,
+        _profile(Path(tmp)) as (home, plugins, extensions, logs),
+    ):
         tmp = Path(tmp)
-        home = tmp / "home"
-        plugins = home / "Documents" / "MuseScore4" / "Plugins"
-        extensions = (
-            home
-            / ".local"
-            / "share"
-            / "MuseScore"
-            / "MuseScore4"
-            / "extensions"
-        )
-        plugins.mkdir(parents=True)
-        extensions.mkdir(parents=True)
         (plugins / HARNESS_NAME).write_text(
             build_harness(commands), encoding="utf-8"
         )
@@ -299,13 +387,10 @@ def run(
             raise RuntimeError(
                 "The harness ran but left no results (did the plugin fail to load?)"
             )
-        # The log is in the throwaway home: ~/.local/share/... for an AppImage, ~/.var/app/... for a Flatpak
         refused = [
             name
-            for log in home.rglob("MuseScore_*.log")
-            for name in refused_actions(
-                log.read_text(errors="replace"), unknown_actions_only
-            )
+            for text in logs()
+            for name in refused_actions(text, unknown_actions_only)
             if name not in GUI_ONLY_ACTIONS
         ]
         if refused:
@@ -384,6 +469,8 @@ def main() -> int:
     )
     for entry in results:
         print(f"{entry['action']} -> {json.dumps(entry['result'])}")
+        if "corrupted" in entry:
+            print(f"    SCORE CORRUPTED: {entry['corrupted']}")
     return (
         1
         if any(
